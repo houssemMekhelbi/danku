@@ -231,7 +231,7 @@ def main() -> int:
     g = Guard(project, name)
     out = g.run(doc)
     if g.errors:
-        print("ai compose: refused, fix the compose file:", file=sys.stderr)
+        print("danku compose: refused, fix the compose file:", file=sys.stderr)
         for e in g.errors:
             print("  " + e, file=sys.stderr)
         return 1

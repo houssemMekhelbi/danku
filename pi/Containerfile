@@ -1,4 +1,4 @@
-FROM localhost/ai-base:1
+FROM localhost/danku-base:1
 USER root
 # claude-code too: pi-claude-bridge drives it (pathToClaudeCodeExecutable in ~/.pi/agent/claude-bridge.json),
 # the SDK's bundled binary cannot refresh OAuth through the proxy.

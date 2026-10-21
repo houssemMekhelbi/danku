@@ -1,4 +1,4 @@
-# Demo stack for `ai compose`: Postgres seeded from ./seed, plus a tiny HTTP service.
+# Demo stack for `danku compose`: Postgres seeded from ./seed, plus a tiny HTTP service.
 services:
   db:
     image: docker.io/library/postgres:16-alpine

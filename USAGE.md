@@ -1,17 +1,17 @@
-# ai — quick usage
+# danku — quick usage
 
-Script: `<repo>/ai` (on PATH as `ai`). Run it on the **host**, never from inside a session.
+Script: `<repo>/danku` (on PATH as `danku`). Run it on the **host**, never from inside a session.
 
 ## Run
 
 ```sh
-ai claude ~/projects/foo          # Claude Code in the sandbox
-ai codex  ~/projects/foo
-ai pi     ~/projects/foo
-ai claude ~/projects/foo --resume  # anything after the dir goes to the harness
-ai shell claude ~/projects/foo     # same sandbox, bash instead (to poke around)
-ai shell claude ~/projects/foo -c 'npm test'   # one command, then exit
-ai build                                    # rebuild images (after editing a Containerfile / version bump)
+danku claude ~/projects/foo          # Claude Code in the sandbox
+danku codex  ~/projects/foo
+danku pi     ~/projects/foo
+danku claude ~/projects/foo --resume  # anything after the dir goes to the harness
+danku shell claude ~/projects/foo     # same sandbox, bash instead (to poke around)
+danku shell claude ~/projects/foo -c 'npm test'   # one command, then exit
+danku build                                    # rebuild images (after editing a Containerfile / version bump)
 ```
 
 Inside the session:
@@ -19,22 +19,22 @@ Inside the session:
 | What | Where |
 |---|---|
 | your project (read-write) | `/workspace/<dir-name>` |
-| home of the agent | `/home/agent` = host `$AI_STATE/<harness>/home` (logins live here) |
+| home of the agent | `/home/agent` = host `$DANKU_STATE/<harness>/home` (logins live here) |
 | everything else of yours | not visible |
-| local model server | `$LLAMA_URL`, when `AI_LLAMA_URL` is set on the host |
-| am I sandboxed? | `echo $AI_SANDBOX` → `1` |
+| local model server | `$LLAMA_URL`, when `DANKU_LLAMA_URL` is set on the host |
+| am I sandboxed? | `echo $DANKU_SANDBOX` → `1` |
 
 ## Paths: which projects are allowed
 
-- Any dir under `$AI_ROOTS` (default `~/projects`) works (symlinks are followed, the real path must be under it).
-- Somewhere else, one time: `AI_ROOT=/data ai claude /data/thing`
-- Always somewhere else: `export AI_ROOTS=~/projects:/data`.
-- Always refused: `~` itself, `$AI_STATE`, `~/.ssh`, `~/.gnupg`, `~/.config/gh`.
-- Hide a subfolder of the project from the agent: put its relative path in `.ai/mask` (one per line, e.g. `secrets`).
+- Any dir under `$DANKU_ROOTS` (default `~/projects`) works (symlinks are followed, the real path must be under it).
+- Somewhere else, one time: `DANKU_ROOT=/data danku claude /data/thing`
+- Always somewhere else: `export DANKU_ROOTS=~/projects:/data`.
+- Always refused: `~` itself, `$DANKU_STATE`, `~/.ssh`, `~/.gnupg`, `~/.config/gh`.
+- Hide a subfolder of the project from the agent: put its relative path in `.danku/mask` (one per line, e.g. `secrets`).
 
-## Per-project config: `<project>/.ai/`
+## Per-project config: `<project>/.danku/`
 
-Create the folder, add only the files you need. **Changes apply at the next session start**: quit and rerun `ai ...`.
+Create the folder, add only the files you need. **Changes apply at the next session start**: quit and rerun `danku ...`.
 
 | File | Effect | Example line |
 |---|---|---|
@@ -46,50 +46,50 @@ Create the folder, add only the files you need. **Changes apply at the next sess
 | `mask` | subdirs hidden inside the sandbox | `secrets` |
 | `ssh-agent` | empty file: the agent may *sign* with your loaded ssh keys | (empty) |
 
-API keys / tokens for the project: `$AI_STATE/projects/<dir-name>/env` with `KEY=value` lines. They show up as env vars inside. That file is never in the project, so the agent can't edit it.
+API keys / tokens for the project: `$DANKU_STATE/projects/<dir-name>/env` with `KEY=value` lines. They show up as env vars inside. That file is never in the project, so the agent can't edit it.
 
 ### Add / remove a permission
 
 ```sh
 cd ~/projects/foo
-mkdir -p .ai
-echo '^api\.stripe\.com$' >> .ai/allow     # add a site
-sed -i '/stripe/d' .ai/allow               # remove it
-rm .ai/ssh-agent                           # revoke ssh signing
+mkdir -p .danku
+echo '^api\.stripe\.com$' >> .danku/allow     # add a site
+sed -i '/stripe/d' .danku/allow               # remove it
+rm .danku/ssh-agent                           # revoke ssh signing
 ```
 
 Allowed for **all** projects: `proxy/allowlist` (Anthropic, OpenAI, npm, PyPI, Maven). Edit, then restart the sessions.
 
 Is a site blocked? Inside: `curl -v https://site` → `CONNECT tunnel failed, response 403` = not on the allowlist.
 
-> Until the security fixes land, the agent can write `.ai/` itself. Check `git diff .ai` / `cat .ai/*` before you start a session.
+> Until the security fixes land, the agent can write `.danku/` itself. Check `git diff .danku` / `cat .danku/*` before you start a session.
 
 ## Dev server: open the app from the host
 
 **Port known in advance** (server must listen on `0.0.0.0`, e.g. `vite --host`, `next dev -H 0.0.0.0`):
 
 ```sh
-echo 3000 >> ~/projects/foo/.ai/publish
-ai claude ~/projects/foo
+echo 3000 >> ~/projects/foo/.danku/publish
+danku claude ~/projects/foo
 # browser on host: http://127.0.0.1:3000
 ```
 
 **Port not known / server only listens on localhost** (session already running, second terminal):
 
 ```sh
-ai ports foo            # list ports listening inside the session
-ai port foo 5173        # host 127.0.0.1:5173 -> session :5173   (Ctrl-C stops)
-ai port foo 5173 8080   # same, but on host port 8080
+danku ports foo            # list ports listening inside the session
+danku port foo 5173        # host 127.0.0.1:5173 -> session :5173   (Ctrl-C stops)
+danku port foo 5173 8080   # same, but on host port 8080
 ```
 
-If several sessions of `foo` are running, `ai port`/`ai ports` refuse; close the extras.
+If several sessions of `foo` are running, `danku port`/`danku ports` refuse; close the extras.
 
 ## Test an API
 
 ```sh
-# inside the session (agent or ai shell)
+# inside the session (agent or danku shell)
 curl http://localhost:8000/health
-# from the host, after publish or `ai port`
+# from the host, after publish or `danku port`
 curl http://127.0.0.1:8000/health
 ```
 
@@ -110,10 +110,10 @@ tailscale serve reset         # stop sharing
 The agent writes `compose.yaml` in the project. **You** start it from the host:
 
 ```sh
-ai compose foo check      # validate only (paths inside project, no privileges, ports -> 127.0.0.1)
-ai compose foo up         # start; running sessions join its network
-ai compose foo ps | logs [svc] | restart [svc]
-ai compose foo down       # stop (add -v to delete volumes)
+danku compose foo check      # validate only (paths inside project, no privileges, ports -> 127.0.0.1)
+danku compose foo up         # start; running sessions join its network
+danku compose foo ps | logs [svc] | restart [svc]
+danku compose foo down       # stop (add -v to delete volumes)
 ```
 
 - From the session, services answer by name: `db:5432`, `http://web:8000`.
@@ -129,12 +129,12 @@ ai compose foo down       # stop (add -v to delete volumes)
 
 | Message | Do |
 |---|---|
-| `... not below any of: ~/projects` | `AI_ROOT=<parent dir> ai ...` |
-| `refusing to mount ...` | that's home, $AI_STATE or a key dir; pick a project subdir |
-| `missing $AI_STATE/<h>/home` | `mkdir -p` it, start the session, log in there once |
-| image not found / `--pull=never` error | `ai build` |
-| site unreachable inside | add it to `.ai/allow`, restart the session |
+| `... not below any of: ~/projects` | `DANKU_ROOT=<parent dir> danku ...` |
+| `refusing to mount ...` | that's home, $DANKU_STATE or a key dir; pick a project subdir |
+| `missing $DANKU_STATE/<h>/home` | `mkdir -p` it, start the session, log in there once |
+| image not found / `--pull=never` error | `danku build` |
+| site unreachable inside | add it to `.danku/allow`, restart the session |
 | `no running session for foo` | start one first; `foo` = project dir name |
-| `ai compose: refused ...` | read the listed lines, fix `compose.yaml`, `ai compose foo check` |
+| `danku compose: refused ...` | read the listed lines, fix `compose.yaml`, `danku compose foo check` |
 
 Full check of compose + networking: `tests/compose-test.sh` (run on host).

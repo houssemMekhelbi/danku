@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck -S warning ai help.sh tests/compose-test.sh
+        run: shellcheck -S warning danku help.sh tests/compose-test.sh
       - name: compose-guard unit tests
         run: |
           python3 -m pip install --quiet pyyaml
