@@ -1,0 +1,1 @@
+CREATE TABLE demo(id int); INSERT INTO demo VALUES (42);

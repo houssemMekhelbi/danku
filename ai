@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+# ai: run an AI coding harness in a rootless podman sandbox.
+#   ai <claude|codex|pi> <project-dir> [harness args...]
+#   ai shell <claude|codex|pi> <project-dir> [cmd...]   same sandbox, /bin/bash (verification)
+#   ai help [command|topic]                             help; ai <command> -h works too (help.sh)
+#   ai build                                            (re)build base, harness and proxy images
+#   ai ports <project>                                  listening TCP ports inside the running session
+#   ai port <project> <port> [host-port]                forward 127.0.0.1:<host-port> into the session (Ctrl-C ends)
+#   ai compose <project> up|down|ps|logs|restart [...]  run the project's compose stack on the host, fenced by
+#                                                       compose-guard.py, on an internal network the session joins
+#
+# Sandbox: read-only rootfs, no caps, pids/memory limits, two mounts (project at /workspace/<name>,
+# $HOME from $AI_STATE/<harness>/home). Egress only through a per-session tinyproxy on a private
+# internal network, allowlist = proxy/allowlist + <project>/.ai/allow. No resolver inside.
+#
+# Optional per-project config, <project>/.ai/:
+#   allow       extra host regexes (ERE, one per line) for the proxy
+#   ports       extra CONNECT ports (443 always)
+#   apt, pip    packages baked into localhost/ai-<harness>-<project>:<hash> (pip goes to /opt/venv)
+#   ssh-agent   file exists = mount the user ssh-agent socket (agent can sign with loaded keys, never read them)
+#   mask        relative subpaths (dirs) hidden inside the sandbox with an empty read-only tmpfs, e.g. `gh`
+#   publish     fixed TCP ports (one per line) published to 127.0.0.1 at start; server must bind 0.0.0.0.
+#               Unknown ports: `ai ports` then `ai port` at runtime, which works for loopback-only servers too.
+# pi dotfiles (optional, AI_PI_DOTFILES): mounted rw at /home/agent/my-pi; $AI_STATE/pi/home/.pi/agent holds
+#   relative symlinks (settings.json, themes, extensions, skills, prompts -> ../../my-pi/...). Secrets and state
+#   (auth.json, sessions, npm) stay real files in $AI_STATE. New config dir in the repo = one more symlink there.
+#   Per-project pi config (optional, AI_PI_PROJECTS): $pi_projects/<name>/ (same layout: settings.json, skills/, extensions/, ...) is mounted
+#   onto /workspace/<name>/.pi when it exists. Refused if the project repo tracks its own .pi/ (would be hidden).
+# compose: services run under the host's rootless podman as project ai-<name>; the agent edits the compose file,
+#   compose-guard.py fences it (paths inside the project, no privilege keys, ports on 127.0.0.1, networks internal)
+#   and the validated copy is kept in ~/.local/state/ai/compose/<name>/stack.yaml. Running sessions of the project
+#   are attached to the stack networks (service names resolve); new sessions join them at start.
+# AI_ROOT=<dir>  one-off extra root for this run, for projects (or symlink targets) outside `roots`.
+# $AI_STATE/projects/<project>/env   passed with --env-file: read-only, single-host tokens only.
+#
+# Settings (environment):
+#   AI_STATE        harness homes and per-project env files      default ${XDG_DATA_HOME:-~/.local/share}/ai
+#   AI_ROOTS        ':'-separated dirs that projects must live under   default ~/projects
+#   AI_LLAMA_URL    optional local model endpoint, exported to the session as LLAMA_URL
+#   AI_MEM          session memory limit                          default 16g
+set -Eeuo pipefail
+
+here=$(dirname "$(realpath "$0")")
+state=$(realpath -m "${AI_STATE:-${XDG_DATA_HOME:-$HOME/.local/share}/ai}")
+# A project may be given as a symlink; it is resolved and the real directory is mounted. The real path must
+# be below one of these roots. Never $HOME itself (that would mount ssh keys, tokens and $AI_STATE).
+IFS=: read -r -a roots <<< "${AI_ROOTS:-$HOME/projects}"
+agent_sock=${SSH_AUTH_SOCK:-}
+pi_dotfiles=${AI_PI_DOTFILES:-}
+pi_projects=${AI_PI_PROJECTS:-}
+mem=${AI_MEM:-16g}
+mem_high=$(( $(numfmt --from=iec "${mem^^}") * 5 / 8 ))  # soft limit: reclaim pressure before the hard one
+
+die() { echo "ai: $*" >&2; exit 2; }
+
+build() {
+  podman build -f "$here/base.Containerfile" -t localhost/ai-base:1 "$here"
+  for h in claude codex pi; do podman build -t "localhost/ai-$h:1" "$here/$h"; done
+  podman build -t localhost/ai-proxy:1 "$here/proxy"
+}
+
+# Project image: harness image + .ai/apt + .ai/pip, tagged by content hash, built once.
+project_image() {
+  local harness=$1 project=$2 name=$3
+  local apt="$project/.ai/apt" pip="$project/.ai/pip"
+  [[ -s $apt || -s $pip ]] || { echo "localhost/ai-$harness:1"; return; }
+  local hash; hash=$(cat "$apt" "$pip" 2>/dev/null | sha256sum | cut -c1-12)
+  local tag="localhost/ai-$harness-$name:$hash"
+  if ! podman image exists "$tag"; then
+    local ctx; ctx=$(mktemp -d)
+    {
+      echo "FROM localhost/ai-$harness:1"
+      echo "USER root"
+      [[ ! -s $pip ]] || echo "RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv && rm -rf /var/lib/apt/lists/*"
+      [[ ! -s $apt ]] || echo "RUN apt-get update && apt-get install -y --no-install-recommends $(tr '\n' ' ' < "$apt") && rm -rf /var/lib/apt/lists/*"
+      [[ ! -s $pip ]] || echo "RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir $(tr '\n' ' ' < "$pip")"
+      [[ ! -s $pip ]] || echo 'ENV PATH=/opt/venv/bin:$PATH'
+      echo "USER agent"
+    } > "$ctx/Containerfile"
+    podman build -q -t "$tag" "$ctx" >&2
+    rm -rf "$ctx"
+  fi
+  echo "$tag"
+}
+
+# Resolve and vet a user-given project path. Sets globals: project (real path), name (after the link, '.' -> dir).
+resolve_project() {
+  local given=${1%/}
+  project=$(realpath -e "$given") || die "$given does not exist (dangling symlink?)"
+  local ok=0 r; for r in "${roots[@]}" ${AI_ROOT:+"$(realpath -e "$AI_ROOT")"}; do [[ $project == "$r"/* ]] && ok=1; done
+  (( ok )) || die "$given resolves to $project, not below any of: ${roots[*]}. One-off: AI_ROOT=$(dirname "$project") ai ..."
+  # Never, whatever the roots: home itself (exact match only, roots live under it), $AI_STATE, and the key/token dirs.
+  [[ $project != "$HOME" ]] || die "refusing to mount $project"
+  for r in "$state" "$HOME/.ssh" "$HOME/.gnupg" "$HOME/.config/gh"; do
+    [[ $project != "$r" && $project != "$r"/* ]] || die "refusing to mount $project"
+  done
+  [[ $project != "$HOME"/.* ]] || echo "ai: warning: mounting dotfile dir $project rw; hide secrets with $project/.ai/mask" >&2
+  name=$(basename "$(realpath -s "$given")")
+}
+
+# Networks of the project's compose stack (podman-compose names them <compose-project>_<net>).
+stack_nets() { podman network ls --format '{{.Name}}' | grep -E "^ai-$1_" || true; }
+
+run() {
+  local entry=$1 harness=$2; shift 2
+  case $harness in claude|codex|pi) ;; *) die "harness must be claude, codex or pi" ;; esac
+  local project name; resolve_project "$1"; shift
+  local home=$state/$harness/home
+  [[ -d $home ]] || die "missing $home (mkdir -p it, then log in once inside the session)"
+  local ws=/workspace/$name
+  # session, net, proxy, rt are globals: the EXIT trap needs them after run() returns
+  session="ai-$harness-$name-$$"
+  net="$session-net"; proxy="$session-proxy"
+  rt="${XDG_RUNTIME_DIR:-/run/user/$UID}/ai/$session"; mkdir -p "$rt"
+
+  # --- per-session proxy: global allowlist + project allowlist, global ports + project ports
+  cat "$here/proxy/allowlist" > "$rt/allowlist"
+  [[ ! -s $project/.ai/allow ]] || { echo; cat "$project/.ai/allow"; } >> "$rt/allowlist"
+  # Compose services are reached by single-label names. The proxy has no search domain and resolves them only
+  # through $rt/hosts (written by stack_hosts), so this matches nothing else.
+  printf '\n# compose stack services\n^[a-z0-9][a-z0-9_-]*$\n' >> "$rt/allowlist"
+  # Proxy resolver: fixed file, not podman-managed. Joining a stack network would otherwise put aardvark first in
+  # resolv.conf, and it answers NXDOMAIN for every external name on an internal network.
+  printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > "$rt/resolv.conf"
+  printf '127.0.0.1 localhost\n' > "$rt/hosts"
+  local -a stacknets=(); local sn; for sn in $(stack_nets "$name"); do stacknets+=(--network "$sn"); done
+  { grep -v '^ConnectPort' "$here/proxy/tinyproxy.conf"
+    for p in 443 $(cat "$project/.ai/ports" 2>/dev/null); do echo "ConnectPort $p"; done
+  } > "$rt/tinyproxy.conf"
+  podman network create --internal --disable-dns "$net" >/dev/null
+  cleanup() {
+    podman rm -f "$proxy" >/dev/null 2>&1 || true
+    podman network rm -f "$net" >/dev/null 2>&1 || true
+    rm -rf "$rt"
+  }
+  trap cleanup EXIT
+  podman run -d --name "$proxy" --pull=never \
+    --network "$net" --network podman "${stacknets[@]}" \
+    --dns none \
+    --volume "$rt/resolv.conf:/etc/resolv.conf:ro" --volume "$rt/hosts:/etc/hosts:ro" \
+    --read-only --cap-drop=all --security-opt=no-new-privileges \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m \
+    --pids-limit=256 --memory=256m \
+    --volume "$rt/allowlist:/etc/tinyproxy/allowlist:ro" \
+    --volume "$rt/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro" \
+    localhost/ai-proxy:1 >/dev/null
+  local proxy_ip; proxy_ip=$(podman inspect -f "{{(index .NetworkSettings.Networks \"$net\").IPAddress}}" "$proxy")
+  [[ -n $proxy_ip ]] || die "proxy got no address on $net"
+  (( ${#stacknets[@]} == 0 )) || stack_hosts "$name" "$rt"
+
+  # --- optional extras
+  local -a extra=()
+  # pi-claude-bridge spawns Claude Code, which needs the Claude credential dir; same account, shared on purpose.
+  [[ $harness != pi || ! -d $state/claude/home/.claude ]] || extra+=(--volume "$state/claude/home/.claude:/home/agent/.claude:rw,rprivate")
+  # pi config can live in a dotfiles repo; rw because pi rewrites settings.json in place (through the symlink).
+  if [[ $harness == pi && -n $pi_dotfiles ]]; then
+    [[ -d $pi_dotfiles ]] || die "missing pi dotfiles $pi_dotfiles"
+    # Mountpoint must be a real dir. Agents in older sessions (no mount) replace it with a symlink to their
+    # workspace, which podman cannot mount onto. A symlink is dropped; anything else is left alone.
+    [[ ! -L $home/my-pi ]] || { echo "ai: $home/my-pi was a symlink, restoring mountpoint dir" >&2; rm "$home/my-pi"; }
+    mkdir -p "$home/my-pi"
+    # Same agents also rewrite the agent-dir links to absolute /workspace/pi/...; repoint them at the mount.
+    local l t; for l in "$home"/.pi/agent/*; do
+      [[ -L $l ]] || continue; t=$(readlink "$l")
+      [[ $t != /workspace/pi/* ]] || ln -sfn "../../my-pi/${t#/workspace/pi/}" "$l"
+    done
+    extra+=(--volume "$pi_dotfiles:/home/agent/my-pi:rw,rprivate")
+    if [[ -n $pi_projects && -d $pi_projects/$name ]]; then
+      if git -C "$project" ls-files --error-unmatch .pi >/dev/null 2>&1; then
+        die "$project tracks its own .pi/ and $pi_projects/$name also exists; keep one (the mount would hide the repo's)"
+      fi
+      [[ ! -d $project/.pi ]] || [[ -z $(ls -A "$project/.pi" 2>/dev/null) ]] || [[ -d $project/.git ]] \
+        || echo "ai: warning: $project/.pi is non-empty and will be hidden by $pi_projects/$name" >&2
+      mkdir -p "$project/.pi"  # mountpoint as the user; podman would create it owned by a sub-uid
+      extra+=(--volume "$pi_projects/$name:$ws/.pi:rw,rprivate")
+    fi
+  fi
+  # .ai/mask: cover listed subdirs with an empty read-only tmpfs. Only existing dirs (podman would mkdir otherwise).
+  if [[ -s $project/.ai/mask ]]; then
+    local m; while read -r m; do
+      [[ -n $m && $m != \#* ]] || continue
+      [[ $m != /* && $m != *..* ]] || die ".ai/mask: '$m' must be a relative path without .."
+      [[ -d $project/$m ]] && extra+=(--tmpfs "$ws/$m:ro,size=4k")
+    done < "$project/.ai/mask"
+  fi
+  if [[ -s $project/.ai/publish ]]; then
+    local pp; while read -r pp; do
+      [[ -n $pp && $pp != \#* ]] || continue
+      [[ $pp =~ ^[0-9]+$ && $pp -ge 1 && $pp -le 65535 ]] || die ".ai/publish: '$pp' is not a port"
+      extra+=(--publish "127.0.0.1:$pp:$pp")
+    done < "$project/.ai/publish"
+  fi
+  if [[ -e $project/.ai/ssh-agent ]]; then
+    [[ -n $agent_sock && -S $agent_sock ]] || die "$project/.ai/ssh-agent set but SSH_AUTH_SOCK is not a socket"
+    extra+=(--volume "$agent_sock:$agent_sock" --env "SSH_AUTH_SOCK=$agent_sock")
+  fi
+  [[ ! -f $state/projects/$name/env ]] || extra+=(--env-file "$state/projects/$name/env")
+  [[ -z ${AI_LLAMA_URL:-} ]] || extra+=(--env "LLAMA_URL=$AI_LLAMA_URL")
+  # Compose stack already up for this project: join its (internal) networks so service names resolve.
+  extra+=("${stacknets[@]}")
+  local -a gitenv=()  # identity from the project repo (or global); git inside has no hooks and no signing key
+  local gn ge; gn=$(git -C "$project" config user.name || true); ge=$(git -C "$project" config user.email || true)
+  [[ -z $gn ]] || gitenv+=(--env "GIT_AUTHOR_NAME=$gn" --env "GIT_COMMITTER_NAME=$gn")
+  [[ -z $ge ]] || gitenv+=(--env "GIT_AUTHOR_EMAIL=$ge" --env "GIT_COMMITTER_EMAIL=$ge")
+  local -a entryflag=(); [[ -z $entry ]] || entryflag=(--entrypoint "$entry")
+  local tty=-it; [[ -z ${AI_NOTTY:-} ]] || tty=-i
+  local image; image=$(project_image "$harness" "$project" "$name") || die "project image build failed"
+
+  # Only these mounts, ever: project, harness home, and the opt-ins above. Never a user-supplied --volume.
+  podman run --rm $tty --pull=never \
+    --name "$session" --hostname "$session" \
+    --network "$net" \
+    --userns=keep-id --user "$(id -u):$(id -g)" \
+    --workdir "$ws" \
+    --read-only --cap-drop=all --security-opt=no-new-privileges \
+    --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m \
+    --pids-limit=2048 --memory=$mem --cgroup-conf=memory.high=$mem_high \
+    --volume "$project:$ws:rw,rprivate" \
+    --volume "$home:/home/agent:rw,rprivate" \
+    "${extra[@]}" "${gitenv[@]}" \
+    --env HTTP_PROXY=http://$proxy_ip:8888 --env HTTPS_PROXY=http://$proxy_ip:8888 \
+    --env http_proxy=http://$proxy_ip:8888 --env https_proxy=http://$proxy_ip:8888 \
+    --env NO_PROXY=localhost,127.0.0.1 --env AI_SANDBOX=1 --env AI_PROXY=$proxy_ip:8888 \
+    --env TERM="${TERM:-xterm-256color}" \
+    "${entryflag[@]}" "$image" "$@"
+}
+
+# Running session container for a project (by basename, any harness). Exactly one must match.
+session_of() {
+  local name; name=$(basename "$(realpath -s "${1%/}")")
+  local -a c; mapfile -t c < <(podman ps --format '{{.Names}}' | grep -E "^ai-(claude|codex|pi)-$name-[0-9]+$")
+  (( ${#c[@]} )) || die "no running session for $name"
+  (( ${#c[@]} == 1 )) || die "several sessions for $name, stop one: ${c[*]}"
+  echo "${c[0]}"
+}
+
+# Listening TCP sockets inside the container, from /proc/net/tcp{,6} (state 0A = LISTEN). No tools needed inside.
+ports() {
+  local c; c=$(session_of "$1")
+  echo "$c:"
+  podman exec "$c" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+    | awk '$4=="0A" { split($2,a,":"); port=strtonum("0x" a[2]); addr=a[1]
+                      if (addr=="0100007F" || addr=="00000000000000000000000001000000") scope="loopback only"
+                      else if (addr=="00000000" || addr=="00000000000000000000000000000000") scope="all interfaces"
+                      else scope=addr
+                      printf "  %5d  %s\n", port, scope }' | sort -un -k1,1
+}
+
+# Forward 127.0.0.1:$3 (default: same port) into the container; each connection runs nc inside via podman exec,
+# so it reaches servers bound to loopback too. Inbound only; the sandbox gains nothing.
+port() {
+  local c; c=$(session_of "$1"); local p=$2 hp=${3:-$2}
+  [[ $p =~ ^[0-9]+$ && $hp =~ ^[0-9]+$ ]] || die 'usage: ai port <project> <port> [host-port]'
+  command -v socat >/dev/null || die "socat missing (install the socat package)"
+  echo "ai: http://127.0.0.1:$hp -> $c:$p  (Ctrl-C to stop)" >&2
+  exec socat TCP-LISTEN:"$hp",bind=127.0.0.1,reuseaddr,fork EXEC:"podman exec -i $c nc -q 0 localhost $p"
+}
+
+# --- compose -------------------------------------------------------------------------------------------
+compose_file() {
+  local f; for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [[ -f $1/$f ]] && { echo "$1/$f"; return; }
+  done; return 1
+}
+# The session resolves service names through aardvark on the stack network. The proxy cannot (see resolv.conf
+# note in run), so its bind-mounted hosts file gets "<ip> <aliases>" for every stack container. Written in place:
+# the mount follows the inode.
+stack_hosts() {
+  local name=$1 rt=$2 cid
+  { echo '127.0.0.1 localhost'
+    for cid in $(podman ps -q --filter "label=io.podman.compose.project=ai-$name"); do
+      podman inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{if $v.IPAddress}}{{$v.IPAddress}}{{range $v.Aliases}} {{.}}{{end}} # ai-stack{{"\n"}}{{end}}{{end}}' "$cid"
+    done
+  } > "$rt/hosts"
+}
+sessions_of() { podman ps --format '{{.Names}}' | grep -E "^ai-(claude|codex|pi)-$1-[0-9]+$" || true; }
+# Attach/detach every running session of the project (and its proxy) to/from the stack networks.
+stack_attach() {
+  local c n; for c in $(sessions_of "$1"); do
+    for n in $(stack_nets "$1"); do
+      podman network connect "$n" "$c" 2>/dev/null && echo "ai: $c joined $n" >&2 || true
+      podman network connect "$n" "$c-proxy" 2>/dev/null || true
+    done
+    stack_hosts "$1" "${XDG_RUNTIME_DIR:-/run/user/$UID}/ai/$c"
+  done
+}
+stack_detach() {
+  local c n; for c in $(sessions_of "$1"); do
+    for n in $(stack_nets "$1"); do
+      podman network disconnect "$n" "$c" 2>/dev/null || true
+      podman network disconnect "$n" "$c-proxy" 2>/dev/null || true
+    done
+    printf '127.0.0.1 localhost\n' > "${XDG_RUNTIME_DIR:-/run/user/$UID}/ai/$c/hosts"
+  done
+}
+compose() {
+  local project name; resolve_project "$1"; local verb=$2; shift 2
+  local cf; cf=$(compose_file "$project") || die "no compose.yaml / docker-compose.yaml in $project"
+  local cp="ai-$name" st="${XDG_STATE_HOME:-$HOME/.local/state}/ai/compose/$name"; mkdir -p "$st"
+  local -a pc=(podman-compose -p "$cp" -f "$st/stack.yaml")
+  guard() {  # resolve + fence the agent's file into $st/stack.yaml; nothing runs if the guard refuses
+    podman-compose -f "$cf" config > "$st/resolved.yaml" || die "compose config failed"
+    /usr/bin/python3 -I "$here/compose-guard.py" "$project" "$name" "$st/resolved.yaml" > "$st/stack.yaml.new" || { rm -f "$st/stack.yaml.new"; exit 1; }
+    mv "$st/stack.yaml.new" "$st/stack.yaml"
+  }
+  case $verb in
+    check) guard; echo "ai compose: $cf passes; validated copy in $st/stack.yaml" ;;
+    up) guard; "${pc[@]}" up -d "$@"; stack_attach "$name" ;;
+    restart) guard; "${pc[@]}" up -d --force-recreate "$@"; stack_attach "$name" ;;
+    down) [[ -f $st/stack.yaml ]] || guard; stack_detach "$name"; "${pc[@]}" down "$@" ;;
+    ps|logs) [[ -f $st/stack.yaml ]] || die "stack never started; run: ai compose $name up"; "${pc[@]}" "$verb" "$@" ;;
+    *) die 'usage: ai compose <project> check|up|down|ps|logs|restart [service...]' ;;
+  esac
+}
+
+# `ai <cmd> -h|--help` (right after the command) shows that command's help instead of running it.
+show_help() { source "$here/help.sh"; ai_help "$@"; }
+usage() { echo "ai: usage: $1" >&2; echo "    more: ai help $2" >&2; exit 2; }
+[[ ${2:-} != -h && ${2:-} != --help ]] || { show_help "$1"; exit; }
+
+case ${1:-} in
+  help|-h|--help) shift; show_help "${1:-}" ;;
+  build) build ;;
+  compose) [[ $# -ge 3 ]] || usage 'ai compose <project> check|up|down|ps|logs|restart [...]' compose; shift; compose "$@" ;;
+  ports) [[ $# -eq 2 ]] || usage 'ai ports <project>' ports; ports "$2" ;;
+  port) [[ $# -ge 3 ]] || usage 'ai port <project> <port> [host-port]' port; port "$2" "$3" "${4:-}" ;;
+  shell) [[ $# -ge 3 ]] || usage 'ai shell <harness> <project> [cmd...]' shell; h=$2; p=$3; shift 3; run /bin/bash "$h" "$p" "$@" ;;
+  claude|codex|pi) [[ $# -ge 2 ]] || usage "ai $1 <project> [args]" run; h=$1; p=$2; shift 2; run "" "$h" "$p" "$@" ;;
+  '') show_help >&2; exit 2 ;;
+  *) echo "ai: unknown command '$1'" >&2; echo "    see: ai help" >&2; exit 2 ;;
+esac

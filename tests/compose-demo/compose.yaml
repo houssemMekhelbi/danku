@@ -1,0 +1,24 @@
+# Demo stack for `ai compose`: Postgres seeded from ./seed, plus a tiny HTTP service.
+services:
+  db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: demo
+    volumes:
+      - ./seed:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      retries: 20
+  web:
+    image: docker.io/library/python:3.12-alpine
+    working_dir: /site
+    command: python -m http.server 8000
+    volumes:
+      - ./site:/site:ro
+volumes:
+  pgdata: {}

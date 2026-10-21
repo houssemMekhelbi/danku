@@ -1,0 +1,13 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -S warning ai help.sh tests/compose-test.sh
+      - name: compose-guard unit tests
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 -m unittest discover -s tests -v
